@@ -1,0 +1,5 @@
+openpyxl>=3.1.2
+python-dotenv>=1.0.0
+python-telegram-bot>=21.0
+xlcalculator>=0.5.0
+xlrd==2.0.1
