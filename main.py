@@ -20,6 +20,7 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "gridbot"
 
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
@@ -28,7 +29,11 @@ from telegram.ext import (
 )
 from .config import TOKEN, ADMIN_USER_ID
 from .database import init_db
-from .handlers import start, exit_cmd, handle_text, on_callback
+from .handlers import start, exit_cmd, handle_text, on_callback, sync_env_users
+
+async def _post_init(app: Application) -> None:
+    # Make .env users known (share targets, admin user list) before they message the bot
+    await sync_env_users(app.bot)
 
 def main() -> None:
     if not TOKEN:
@@ -38,7 +43,7 @@ def main() -> None:
 
     init_db()
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))

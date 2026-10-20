@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable
 
 from telegram import (
+    Bot,
     Update,
     User,
     CallbackQuery,
@@ -213,9 +214,31 @@ async def _access_approve(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, 
 async def _access_deny(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str) -> None:
     await _access_decide(q, context, uid, arg, approved=False)
 
-def _shareable_users(uid: int) -> list[tuple]:
-    """Registered users other than `uid` who are allowed to use the bot."""
-    return [u for u in get_other_users(uid) if _is_approved(u[0], u[3])]
+def _env_user_ids() -> list[int]:
+    """Users granted access by .env (the admin and AUTHORIZED_USERS), without duplicates."""
+    ids = [ADMIN_USER_ID] if ADMIN_USER_ID is not None else []
+    return list(dict.fromkeys(ids + AUTHORIZED_USERS))
+
+async def sync_env_users(bot: Bot) -> None:
+    """Add .env users who never messaged the bot to the user directory, so they can be shared with.
+    Telegram only reveals their profile once they have started the bot; others are retried next time."""
+    for user_id in _env_user_ids():
+        if get_user(user_id):
+            continue
+        try:
+            chat = await bot.get_chat(user_id)
+        except TelegramError:
+            continue
+        upsert_user(user_id, chat.full_name or str(user_id), chat.username, None, None)
+
+async def _shareable_users(bot: Bot, uid: int) -> list[tuple]:
+    """Users other than `uid` who are allowed to use the bot, including .env users not registered yet."""
+    await sync_env_users(bot)
+    users = [u for u in get_other_users(uid) if _is_approved(u[0], u[3])]
+    known = {u[0] for u in users}
+    # Telegram wouldn't give us their profile: list them by ID; sending tells the sender if they're unreachable
+    users += [(i, f"User {i}", None, None) for i in _env_user_ids() if i != uid and i not in known]
+    return users
 
 # ---------- User management (admin) ----------
 
@@ -256,6 +279,7 @@ async def _show_users(q: CallbackQuery, uid: int) -> None:
     if not await _require_admin(q, uid):
         return
     set_state(uid, "manage_users")
+    await sync_env_users(q.get_bot())
     # Stable sort: within each group, users stay in name order
     users = sorted(get_other_users(uid), key=lambda u: _ACCESS_ORDER.index(_access_kind(u[0], u[3])))
     rows = [
@@ -452,10 +476,10 @@ async def _fav_share(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: 
         return
     fav_id, nickname, _fp, _sh, _cell = fav
     set_state(uid, "manage_favs")
-    users = _shareable_users(uid)
+    users = await _shareable_users(context.bot, uid)
     if not users:
         await q.edit_message_text(
-            "There’s nobody to share with yet. Other users need to message the bot at least once first.",
+            "There’s nobody to share with yet. Other users need to message the bot at least once, or be listed in AUTHORIZED_USERS.",
             reply_markup=InlineKeyboardMarkup([_back_exit_row(f"manage:{fav_id}")])
         )
         return
@@ -472,7 +496,7 @@ async def _fav_share_to(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, ui
     if not fav:
         return
     _fav_id, nickname, file_path, sheet_name, cell_coord = fav
-    target = next((u for u in _shareable_users(uid) if str(u[0]) == target_arg), None)
+    target = next((u for u in await _shareable_users(context.bot, uid) if str(u[0]) == target_arg), None)
     if not target:
         await q.edit_message_text("That user can’t receive shared favourites.", reply_markup=_exit_kb())
         return
@@ -495,7 +519,7 @@ async def _fav_share_to(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, ui
     except TelegramError:
         delete_share_request(request_id)
         await q.edit_message_text(
-            f"Couldn’t reach {_user_label(target)}. They may have blocked the bot.",
+            f"Couldn’t reach {_user_label(target)}. They may not have started the bot yet, or have blocked it.",
             reply_markup=_exit_kb()
         )
         return
