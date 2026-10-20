@@ -49,6 +49,7 @@ from .database import (
     delete_share_request,
     get_access_request,
     set_access_pending,
+    set_user_status,
     clear_access_request,
     decide_access_request,
 )
@@ -58,13 +59,15 @@ from .database import (
 def _exit_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Exit", callback_data="exit")]])
 
-def _menu_kb(has_favs: bool) -> InlineKeyboardMarkup:
+def _menu_kb(has_favs: bool, uid: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("📂 Select from Excel files", callback_data="menu:files")]
     ]
     if has_favs:
         rows.append([InlineKeyboardButton("⭐ Select from favourites", callback_data="menu:favs")])
         rows.append([InlineKeyboardButton("⚙️ Manage favourites", callback_data="menu:manage")])
+    if uid == ADMIN_USER_ID:
+        rows.append([InlineKeyboardButton("👥 Manage users", callback_data="menu:users")])
     rows.append([InlineKeyboardButton("❌ Exit", callback_data="exit")])
     return InlineKeyboardMarkup(rows)
 
@@ -96,22 +99,33 @@ def _is_approved(user_id: int, status: str | None) -> bool:
     """Approved = the admin, listed in AUTHORIZED_USERS, or approved by the admin (stored in the DB)."""
     return user_id == ADMIN_USER_ID or user_id in AUTHORIZED_USERS or status == "approved"
 
-def _access_request_text(req: tuple) -> str:
-    """HTML summary of an access request for the admin, including the decision once made."""
-    user_id, full_name, username, language_code, is_premium, status, requested_at, decided_at = req
+def _profile_lines(req: tuple) -> list[str]:
+    """HTML lines describing a user, from a get_access_request() row."""
+    user_id, full_name, username, language_code, is_premium, _status, requested_at, _decided_at = req
     lines = [
-        "🔐 Access request",
         f'👤 <a href="tg://user?id={user_id}">{html.escape(full_name)}</a>',
         f"🔗 @{html.escape(username)}" if username else "🔗 No username",
         f"🆔 <code>{user_id}</code>",
         f"🌐 Language: {html.escape(language_code or 'unknown')}",
         f"⭐ Premium: {'yes' if is_premium else 'no'}",
-        f"🕒 Requested: {requested_at} UTC",
     ]
+    if requested_at:
+        lines.append(f"🕒 Requested: {requested_at} UTC")
+    return lines
+
+def _decision_line(status: str | None, decided_at: str | None) -> str | None:
     if status == "approved":
-        lines += ["", f"✅ Approved {decided_at} UTC"]
-    elif status == "denied":
-        lines += ["", f"❌ Denied {decided_at} UTC"]
+        return f"✅ Approved {decided_at} UTC"
+    if status == "denied":
+        return f"❌ Denied {decided_at} UTC"
+    return None
+
+def _access_request_text(req: tuple) -> str:
+    """HTML summary of an access request for the admin, including the decision once made."""
+    lines = ["🔐 Access request", *_profile_lines(req)]
+    decision = _decision_line(req[5], req[7])
+    if decision:
+        lines += ["", decision]
     return "\n".join(lines)
 
 async def _request_access(user: User, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -158,10 +172,15 @@ async def _check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
         await update.callback_query.answer(msg, show_alert=True)
     return False
 
+async def _require_admin(q: CallbackQuery, uid: int) -> bool:
+    if uid != ADMIN_USER_ID:
+        await q.edit_message_text("Only the admin can manage access.")
+        return False
+    return True
+
 async def _access_decide(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str, approved: bool) -> None:
     """Admin answered an access request."""
-    if uid != ADMIN_USER_ID:
-        await q.edit_message_text("Only the admin can review access requests.")
+    if not await _require_admin(q, uid):
         return
     try:
         target_id = int(arg)
@@ -198,6 +217,111 @@ def _shareable_users(uid: int) -> list[tuple]:
     """Registered users other than `uid` who are allowed to use the bot."""
     return [u for u in get_other_users(uid) if _is_approved(u[0], u[3])]
 
+# ---------- User management (admin) ----------
+
+# Icon per access source, in the order users are listed
+_ACCESS_ICONS = {"pending": "⏳", "approved": "✅", "env": "🔑", None: "▫️", "denied": "❌"}
+_ACCESS_ORDER = list(_ACCESS_ICONS)
+
+def _access_kind(user_id: int, status: str | None) -> str | None:
+    """Where a user's access comes from; .env wins over the DB, as in _is_approved."""
+    if user_id in AUTHORIZED_USERS:
+        return "env"
+    return status if status in _ACCESS_ICONS else None
+
+def _user_details_text(req: tuple) -> str:
+    user_id, status, decided_at = req[0], req[5], req[7]
+    kind = _access_kind(user_id, status)
+    if kind == "env":
+        access = "🔑 Listed in AUTHORIZED_USERS (edit .env to change)"
+    elif kind == "pending":
+        access = "⏳ Waiting for approval"
+    else:
+        access = _decision_line(status, decided_at) or "▫️ No access"
+    lines = [*_profile_lines(req), "", f"Access: {access}", f"📌 Favourites: {len(get_favourites(user_id))}"]
+    return "\n".join(lines)
+
+async def _get_managed_user(q: CallbackQuery, arg: str) -> tuple | None:
+    """Look up a user for the admin from callback data (the admin can't manage themselves)."""
+    try:
+        req = get_access_request(int(arg))
+    except ValueError:
+        req = None
+    if not req or req[0] == ADMIN_USER_ID:
+        await q.edit_message_text("User not found.", reply_markup=InlineKeyboardMarkup([_back_exit_row("menu:users")]))
+        return None
+    return req
+
+async def _show_users(q: CallbackQuery, uid: int) -> None:
+    if not await _require_admin(q, uid):
+        return
+    set_state(uid, "manage_users")
+    # Stable sort: within each group, users stay in name order
+    users = sorted(get_other_users(uid), key=lambda u: _ACCESS_ORDER.index(_access_kind(u[0], u[3])))
+    rows = [
+        [InlineKeyboardButton(f"{_ACCESS_ICONS[_access_kind(u[0], u[3])]} {_user_label(u)}", callback_data=f"user:{u[0]}")]
+        for u in users
+    ]
+    rows.append(_back_exit_row("menu:main"))
+    text = (
+        "👥 Users\n⏳ waiting · ✅ approved · 🔑 in .env · ▫️ no access · ❌ denied"
+        if users else
+        "No other users have messaged the bot yet."
+    )
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+async def _user_manage(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str) -> None:
+    if not await _require_admin(q, uid):
+        return
+    req = await _get_managed_user(q, arg)
+    if not req:
+        return
+    set_state(uid, "manage_users")
+    user_id, status = req[0], req[5]
+    rows: list[list[InlineKeyboardButton]] = []
+    # .env access can't be changed from here, so offer no actions for those users
+    if _access_kind(user_id, status) != "env":
+        actions = []
+        if status != "approved":
+            actions.append(InlineKeyboardButton("✅ Approve", callback_data=f"user_approve:{user_id}"))
+        if status != "denied":
+            label = "🚫 Revoke access" if status == "approved" else "❌ Deny"
+            actions.append(InlineKeyboardButton(label, callback_data=f"user_deny:{user_id}"))
+        rows.append(actions)
+    rows.append(_back_exit_row("menu:users"))
+    await q.edit_message_text(_user_details_text(req), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+async def _user_set_access(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str, approved: bool) -> None:
+    if not await _require_admin(q, uid):
+        return
+    req = await _get_managed_user(q, arg)
+    if not req:
+        return
+    user_id, previous = req[0], req[5]
+    new_status = "approved" if approved else "denied"
+    if _access_kind(user_id, previous) != "env" and previous != new_status:
+        set_user_status(user_id, new_status)
+        if approved:
+            notice = "✅ You now have access to this bot. Send /start to begin."
+        elif previous == "approved":
+            notice = "🚫 Your access to this bot has been revoked."
+        elif previous == "pending":
+            notice = "❌ Your access request was denied."
+        else:
+            notice = None  # They never asked, so there's nothing to tell them
+        if notice:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=notice)
+            except TelegramError:
+                pass  # User has blocked the bot; the change is already stored
+    await _user_manage(q, context, uid, arg)
+
+async def _user_approve(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str) -> None:
+    await _user_set_access(q, context, uid, arg, approved=True)
+
+async def _user_deny(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str) -> None:
+    await _user_set_access(q, context, uid, arg, approved=False)
+
 # ---------- Entry / Exit ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -207,7 +331,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_state(uid, "main_menu")
     favs = get_favourites(uid)
     text = "Choose an option:"
-    kb = _menu_kb(has_favs=bool(favs))
+    kb = _menu_kb(has_favs=bool(favs), uid=uid)
     if update.message:
         await update.message.reply_text(text, reply_markup=kb)
     else:
@@ -242,7 +366,7 @@ async def _show_manage_list(q: CallbackQuery, uid: int) -> None:
     favs = get_favourites(uid)
     if not favs:
         set_state(uid, "main_menu")
-        await q.edit_message_text("No favourites saved yet.", reply_markup=_menu_kb(False))
+        await q.edit_message_text("No favourites saved yet.", reply_markup=_menu_kb(False, uid=uid))
         return
     set_state(uid, "manage_favs")
     rows = [
@@ -320,7 +444,7 @@ async def _fav_delete_confirm(q: CallbackQuery, context: ContextTypes.DEFAULT_TY
     await q.edit_message_text(f"Favourite “{nickname}” deleted 🗑")
     favs = get_favourites(uid)
     set_state(uid, "main_menu")
-    await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+    await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
 
 async def _fav_share(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str) -> None:
     fav = await _get_owned_fav(q, uid, arg)
@@ -379,7 +503,7 @@ async def _fav_share_to(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, ui
     await q.edit_message_text(f"📤 Sent “{nickname}” to {_user_label(target)}. You’ll be notified when they respond.")
     favs = get_favourites(uid)
     set_state(uid, "main_menu")
-    await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+    await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
 
 async def _share_respond(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid: int, arg: str, accepted: bool) -> None:
     """Recipient answered a share request. Leaves their conversation state alone: they may be mid-flow."""
@@ -424,6 +548,9 @@ async def _share_deny(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, uid:
 _CALLBACK_ACTIONS = {
     "access_approve": _access_approve,
     "access_deny": _access_deny,
+    "user": _user_manage,
+    "user_approve": _user_approve,
+    "user_deny": _user_deny,
     "manage": _fav_manage,
     "rename": _fav_rename,
     "relocate": _fav_relocate,
@@ -456,11 +583,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "menu:main":
         favs = get_favourites(uid)
         set_state(uid, "main_menu")
-        await q.edit_message_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+        await q.edit_message_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         return
 
     if data == "menu:manage":
         await _show_manage_list(q, uid)
+        return
+
+    if data == "menu:users":
+        await _show_users(q, uid)
         return
 
     if data == "menu:files":
@@ -482,7 +613,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "menu:favs":
         favs = get_favourites(uid)
         if not favs:
-            await q.edit_message_text("No favourites saved yet.", reply_markup=_menu_kb(False))
+            await q.edit_message_text("No favourites saved yet.", reply_markup=_menu_kb(False, uid=uid))
             set_state(uid, "main_menu")
             return
         # show by nickname, carry DB id in callback
@@ -551,7 +682,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.edit_message_text(f"Value for *{nickname}* ({sheet_name}!{cell_coord}): {value}", parse_mode="Markdown")
         # Back to main menu
         favs = get_favourites(uid)
-        await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+        await q.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         set_state(uid, "main_menu")
         return
 
@@ -579,7 +710,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not st:
         favs = get_favourites(uid)
         set_state(uid, "main_menu")
-        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         return
 
     step = st.get("step")
@@ -611,7 +742,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             favs = get_favourites(uid)
             clear_state(uid)
             set_state(uid, "main_menu")
-            await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+            await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
             return
 
         # Ask to save favourite if not already there
@@ -625,7 +756,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # Back to main menu
             favs = get_favourites(uid)
             set_state(uid, "main_menu")
-            await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+            await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         return
 
     # Expecting a nickname for favourite
@@ -638,7 +769,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Favourite “{nickname}” saved ✅")
         favs = get_favourites(uid)
         set_state(uid, "main_menu")
-        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         return
 
     # Expecting a new nickname for an existing favourite
@@ -650,10 +781,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Favourite not found.")
         favs = get_favourites(uid)
         set_state(uid, "main_menu")
-        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+        await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))
         return
 
     # Fallback: show menu
     favs = get_favourites(uid)
     set_state(uid, "main_menu")
-    await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs)))
+    await update.message.reply_text("Choose an option:", reply_markup=_menu_kb(has_favs=bool(favs), uid=uid))

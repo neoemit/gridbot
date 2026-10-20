@@ -9,6 +9,7 @@ A Telegram bot that lets you:
 - Save frequently used cells as **favourites** for quick access  
 - Rename, re-point, delete and **share favourites** with other users  
 - Restrict usage to approved users, with access requests reviewed by an admin in Telegram  
+- Let the admin manage users (approve, deny, revoke) from the bot  
 
 ## 🚀 Features
 - Supports both `.xlsx` and `.xls` files  
@@ -31,6 +32,7 @@ gridbot/
 │── excel.py          # Excel file utilities
 │── state.py          # User state management
 │── handlers.py       # Telegram bot handlers
+│── deploy.sh         # Server deployment script
 │── requirements.txt  # Dependencies
 │── README.md         # This file
 ```
@@ -116,6 +118,46 @@ A user can use the bot if they are the admin (`ADMIN_USER_ID`), are listed in `A
 - **Denied**: the user is notified and further attempts are **not** sent to the admin again. They can only get in if they are added manually, either to `AUTHORIZED_USERS` or by setting their `status` to `approved` in the `users` table.
 - Without `ADMIN_USER_ID`, no requests are sent and only already approved users can use the bot.
 - Removing someone from `AUTHORIZED_USERS` revokes their access unless the admin also approved them.
+
+### Managing users (admin)
+
+The admin’s main menu has a **👥 Manage users** button listing everyone who has messaged the bot:
+
+| Icon | Meaning | Actions |
+|------|---------|---------|
+| ⏳ | Waiting for approval | Approve, Deny |
+| ✅ | Approved by the admin | Revoke access |
+| 🔑 | Listed in `AUTHORIZED_USERS` | None (edit `.env` instead) |
+| ▫️ | No access (never requested, or dropped from `AUTHORIZED_USERS`) | Approve, Deny |
+| ❌ | Denied | Approve |
+
+Selecting a user shows their profile details, access status and number of favourites. Users are notified when they are approved, denied or revoked. A revoked user’s favourites are kept, so they’re back if access is restored.
+
+## 🚢 Deployment
+
+On the server, the bot runs as a systemd service from a git checkout. `deploy.sh` updates it in one step:
+
+```bash
+ssh thomas@<server>
+cd ~/gridbot
+./deploy.sh
+```
+
+It will:
+1. Find the systemd service running this checkout (or use `GRIDBOT_SERVICE=<name>`).
+2. Refuse to continue if tracked files were edited on the server.
+3. Fast-forward to the latest `origin/main`, printing the new commits. If you already ran `git pull`, it just redeploys.
+4. Install `requirements.txt` into the virtualenv the service runs with.
+5. Back up the database to `backups/` (the 10 most recent are kept).
+6. Restart the service (with `sudo`), then check it stays up. If it doesn’t, it shows the recent logs and the rollback command.
+
+To roll back, deploy a previous commit; a plain `./deploy.sh` later returns to the latest `main`:
+
+```bash
+./deploy.sh <commit>
+```
+
+The first time, `deploy.sh` isn’t on the server yet: run `git pull` once, then use `./deploy.sh` from then on.
 
 ## 🗄️ Database
 

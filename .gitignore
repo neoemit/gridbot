@@ -211,3 +211,6 @@ favourites.db
 
 # macOS
 .DS_Store
+
+# Database backups made by deploy.sh
+backups/

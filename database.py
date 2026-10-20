@@ -169,6 +169,13 @@ def clear_access_request(user_id: int) -> None:
         (user_id,)
     )
 
+def set_user_status(user_id: int, status: str) -> bool:
+    """Admin override of a user's access, whatever its current status."""
+    return _run(
+        "UPDATE users SET status=?, decided_at=CURRENT_TIMESTAMP WHERE user_id=?",
+        (status, user_id)
+    ) > 0
+
 def decide_access_request(user_id: int, approved: bool) -> bool:
     """Approve or deny a pending request. False if it isn't pending (already decided or never requested)."""
     return _run(
