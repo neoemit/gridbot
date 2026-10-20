@@ -106,7 +106,7 @@ python gridbot/main.py
 - You can save a cell to favourites for quicker future access.  
 - **Manage favourites** lets you rename a favourite, change its file/sheet/cell, delete it, or share it.  
 - **Sharing**: pick another user and they get a message with **Accept** / **Deny** buttons. If they accept, the favourite is copied into their favourites; either way, you’re notified.  
-  Only approved users who have messaged the bot at least once can be picked.  
+  You can pick the admin, anyone in `AUTHORIZED_USERS`, and approved users who have messaged the bot at least once. `.env` users are looked up on Telegram (at startup and when sharing) to show their name; those who haven’t started the bot yet are listed by ID, and they must start it before they can receive a share.  
 - At any step, use `/exit` to stop.  
 
 ### Access approval
