@@ -26,13 +26,15 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-from .config import TOKEN
+from .config import TOKEN, ADMIN_USER_ID
 from .database import init_db
 from .handlers import start, exit_cmd, handle_text, on_callback
 
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("TOKEN is not set. Please set it in your environment or .env file.")
+    if ADMIN_USER_ID is None:
+        print("⚠️ ADMIN_USER_ID is not set: access requests are disabled, so only already approved users can use the bot.")
 
     init_db()
 

@@ -208,3 +208,6 @@ __marimo__/
 
 # Custom
 favourites.db
+
+# macOS
+.DS_Store

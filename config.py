@@ -31,8 +31,13 @@ EXCEL_FOLDER: Path = Path(os.getenv("EXCEL_FOLDER", ".")).expanduser().resolve()
 DB_PATH: str = os.getenv("DB_PATH", "favourites.db")
 
 # Comma-separated list of authorized Telegram user IDs
+# (merged with users the admin approved, which are stored in the DB)
 AUTHORIZED_USERS: list[int] = [
     int(u.strip())
     for u in os.getenv("AUTHORIZED_USERS", "").split(",")
     if u.strip()
 ]
+
+# Telegram user ID of the admin who receives and decides access requests
+_admin_id = os.getenv("ADMIN_USER_ID", "").strip()
+ADMIN_USER_ID: int | None = int(_admin_id) if _admin_id else None
